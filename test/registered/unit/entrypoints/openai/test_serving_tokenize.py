@@ -7,10 +7,12 @@ import json
 import unittest
 from unittest.mock import Mock
 
+from fastapi import Request
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
     DetokenizeRequest,
     TokenizeRequest,
     TokenizeResponse,
@@ -19,6 +21,7 @@ from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
 )
+from sglang.srt.parser.conversation import chat_templates
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -143,6 +146,55 @@ class TestTokenizeFormattingOptions(CustomTestCase):
         self.assertIsInstance(res, TokenizeResponse)
         self.assertIsNone(res.stop)
         self.assertIsNone(res.stop_token_ids)
+
+    def test_tokenize_chat_stop_metadata_round_trips_into_input_ids_request(self):
+        for template_name in ("chatml", "phi-4-mm"):
+            with self.subTest(template=template_name):
+                serving = self._serving(chat_template=template_name)
+                manager = serving.tokenizer_manager
+                manager.tokenizer.eos_token = "</s>"
+                manager.tokenizer.additional_stop_token_ids = [7, 4]
+                manager.model_config.hf_eos_token_id = [2, 7]
+                template_stop = chat_templates[template_name].stop_str
+                if isinstance(template_stop, list):
+                    template_stop = list(template_stop)
+                expected_stops = (
+                    [template_stop]
+                    if isinstance(template_stop, str)
+                    else list(template_stop)
+                )
+                request = TokenizeRequest(model="test-model", messages=HISTORY)
+                response = asyncio.run(
+                    serving._handle_non_streaming_request(request, request, None)
+                )
+                self.assertIsInstance(response, TokenizeResponse)
+                self.assertEqual(response.stop, expected_stops)
+                self.assertEqual(response.stop_token_ids, [2, 4, 7])
+                self.assertEqual(response.count, len(response.tokens))
+
+                raw = Request({"type": "http", "headers": []})
+                for user_stop in ("USER_STOP", [*response.stop, "USER_STOP"], None):
+                    chat_request = ChatCompletionRequest(
+                        model="test-model",
+                        messages=HISTORY,
+                        input_ids=response.tokens,
+                        stop=user_stop,
+                        stop_token_ids=response.stop_token_ids,
+                    )
+                    adapted, _ = serving.chat_serving._convert_to_internal_request(
+                        chat_request, raw
+                    )
+                    self.assertEqual(adapted.input_ids, response.tokens)
+                    self.assertEqual(
+                        adapted.sampling_params["stop"],
+                        expected_stops + (["USER_STOP"] if user_stop else []),
+                    )
+                    self.assertEqual(
+                        adapted.sampling_params["stop_token_ids"], [2, 4, 7]
+                    )
+                # A prior caller's stop list must not mutate the shared template.
+                self.assertEqual(response.stop, expected_stops)
+                self.assertEqual(chat_templates[template_name].stop_str, template_stop)
 
 
 class TestDetokenize(CustomTestCase):
